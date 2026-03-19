@@ -1,1 +1,27 @@
+# Environment variables — NEVER push API keys
+.env
+secrets.toml
+.streamlit/secrets.toml
 
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data files (too large for GitHub)
+*.csv
+*.pkl
+data/
+
+# OS
+.DS_Store
+Thumbs.db
