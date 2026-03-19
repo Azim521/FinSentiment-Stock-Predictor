@@ -394,7 +394,7 @@ else:
         with col_conf:
             st.markdown(f"""<div class="metric-card">
                 <div class="metric-label">Confidence</div>
-                <div class="metric-value" style="color:#667eea;">{confidence}%</div>
+                <div class="metric-value" style="color:#667eea;">{confidence:.1f}%</div>
             </div>""", unsafe_allow_html=True)
         with col_sent_score:
             sent_score = round(
