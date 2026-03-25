@@ -176,26 +176,30 @@ if st.button("Analyze"):
         st.info("No news found.")
 
     # ---------------- MODEL ----------------
-    model, feature_cols = load_model()
+model, feature_cols = load_model()
 
-    if model:
-        df = pd.DataFrame([price_features])
+if model:
+    df = pd.DataFrame([price_features])
 
-        for col in feature_cols:
-            if col not in df.columns:
-                df[col] = 0
+    for col in feature_cols:
+        if col not in df.columns:
+            df[col] = 0
 
-        df = df[feature_cols]
+    df = df[feature_cols]
 
-        pred = model.predict(df)[0]
-        prob = model.predict_proba(df)[0]
+    # ✅ CRITICAL FIX
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df = df.replace([np.inf, -np.inf], 0)
+    df = df.fillna(0)
+    df = df.astype(np.float32)
 
-        st.write("### Prediction")
+    pred = model.predict(df)[0]
+    prob = model.predict_proba(df)[0]
 
-        if pred == 1:
-            st.success(f"📈 UP ({round(max(prob)*100,1)}%)")
-        else:
-            st.error(f"📉 DOWN ({round(max(prob)*100,1)}%)")
-
+    if pred == 1:
+        st.success(f"📈 UP ({round(max(prob)*100,1)}%)")
     else:
-        st.warning("Model not found.")
+        st.error(f"📉 DOWN ({round(max(prob)*100,1)}%)")
+
+else:
+    st.warning("Model not found.")
