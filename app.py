@@ -4,10 +4,11 @@ import numpy as np
 import yfinance as yf
 import requests
 import joblib
-import os
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from transformers import pipeline
 import plotly.graph_objects as go
+from yfinance.exceptions import YFRateLimitError
 
 st.set_page_config(
     page_title="FinSentiment Stock Predictor",
@@ -15,52 +16,33 @@ st.set_page_config(
     layout="wide"
 )
 
+# -------------------- STYLE --------------------
 st.markdown("""
 <style>
-    .main { background-color: #0e1117; }
-    .block-container { padding-top: 2rem; }
-    .metric-card {
-        background: #1e2130;
-        border-radius: 12px;
-        padding: 20px 24px;
-        text-align: center;
-        border: 1px solid #2d3250;
-    }
-    .metric-label {
-        font-size: 12px;
-        color: #8b9ab0;
-        margin-bottom: 6px;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-    .metric-value { font-size: 28px; font-weight: 700; margin: 0; }
-    .up    { color: #2ecc71; }
-    .down  { color: #e74c3c; }
-    .neutral { color: #f39c12; }
-    .news-card {
-        background: #1e2130;
-        border-radius: 10px;
-        padding: 12px 16px;
-        margin: 6px 0;
-        border-left: 4px solid #2d3250;
-    }
-    .news-title { font-size: 13px; color: #c9d1d9; line-height: 1.4; }
-    .news-meta  { font-size: 11px; color: #8b9ab0; margin-top: 4px; }
-    .pos { border-left-color: #2ecc71 !important; }
-    .neg { border-left-color: #e74c3c !important; }
-    .neu { border-left-color: #f39c12 !important; }
+.main { background-color: #0e1117; }
+.metric-card {
+    background: #1e2130;
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+    border: 1px solid #2d3250;
+}
+.metric-label { font-size: 12px; color: #8b9ab0; }
+.metric-value { font-size: 26px; font-weight: bold; }
+.up { color: #2ecc71; }
+.down { color: #e74c3c; }
+.neutral { color: #f39c12; }
 </style>
 """, unsafe_allow_html=True)
 
 NEWS_API_KEY = st.secrets.get("NEWS_API_KEY", "")
 
+# -------------------- LOAD MODELS --------------------
 @st.cache_resource
 def load_finbert():
-    return pipeline(
-        "text-classification",
-        model="ProsusAI/finbert",
-        tokenizer="ProsusAI/finbert"
-    )
+    return pipeline("text-classification",
+                    model="ProsusAI/finbert",
+                    tokenizer="ProsusAI/finbert")
 
 @st.cache_resource
 def load_model():
@@ -71,310 +53,149 @@ def load_model():
     except:
         return None, None
 
-def fetch_news(ticker, company_name):
+# -------------------- FETCH PRICE DATA (FIXED) --------------------
+@st.cache_data(ttl=300)
+def fetch_price_data(ticker):
+    for attempt in range(3):
+        try:
+            df = yf.download(ticker, period="1mo", progress=False)
+
+            if df.empty:
+                return None, None
+
+            latest = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) > 1 else latest
+            closes = df["Close"]
+
+            features = {
+                "daily_return": (latest["Close"] - prev["Close"]) / prev["Close"],
+                "price_vs_ma5": latest["Close"] / closes.tail(5).mean() - 1,
+                "price_vs_ma10": latest["Close"] / closes.tail(10).mean() - 1,
+                "volatility_5d": closes.pct_change().tail(5).std(),
+            }
+
+            delta = closes.diff()
+            gain = delta.clip(lower=0).tail(14).mean()
+            loss = (-delta.clip(upper=0)).tail(14).mean()
+            rs = gain / (loss + 1e-9)
+            features["rsi"] = 100 - (100 / (1 + rs))
+
+            price_info = {
+                "current_price": round(latest["Close"], 2),
+                "change_pct": round((latest["Close"] - prev["Close"]) / prev["Close"] * 100, 2),
+                "history": df["Close"].tail(30)
+            }
+
+            return features, price_info
+
+        except YFRateLimitError:
+            time.sleep(2)
+
+    return None, None
+
+# -------------------- FETCH NEWS --------------------
+def fetch_news(ticker):
     if not NEWS_API_KEY:
         return []
+
     url = "https://newsapi.org/v2/everything"
     params = {
         "q": f"{ticker} stock",
         "language": "en",
         "sortBy": "publishedAt",
-        "pageSize": 20,
+        "pageSize": 10,
         "apiKey": NEWS_API_KEY
     }
+
     try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        articles = data.get("articles", [])
-        return [
-            {
-                "title": a["title"],
-                "source": a["source"]["name"],
-                "publishedAt": a["publishedAt"][:10]
-            }
-            for a in articles
-            if a.get("title") and "[Removed]" not in a["title"]
-        ]
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+        return [a["title"] for a in data.get("articles", []) if a.get("title")]
     except:
         return []
 
+# -------------------- SENTIMENT --------------------
 def analyze_sentiment(headlines, finbert):
-    results = []
+    sentiments = []
     for h in headlines:
         try:
-            result = finbert(h["title"][:512])[0]
-            results.append({
-                "title": h["title"],
-                "source": h["source"],
-                "date": h["publishedAt"],
-                "sentiment": result["label"],
-                "confidence": result["score"],
-                "positive": 1.0 if result["label"] == "positive" else 0.0,
-                "negative": 1.0 if result["label"] == "negative" else 0.0,
-                "neutral":  1.0 if result["label"] == "neutral"  else 0.0,
-            })
+            r = finbert(h[:512])[0]
+            sentiments.append(r["label"])
         except:
             continue
-    return pd.DataFrame(results)
+    return sentiments
 
-def fetch_price_data(ticker):
-    stock = yf.Ticker(ticker)
-    df = stock.history(period="1mo")
-    if df.empty:
-        return None, None
+# -------------------- UI --------------------
+st.title("📈 FinSentiment Stock Predictor")
 
-    latest = df.iloc[-1]
-    prev   = df.iloc[-2] if len(df) > 1 else latest
-    closes = df["Close"]
+STOCKS = ["AAPL", "TSLA", "MSFT", "GOOGL"]
+ticker = st.selectbox("Select Stock", STOCKS)
 
-    features = {
-        "daily_return":    (latest["Close"] - prev["Close"]) / prev["Close"],
-        "return_2d":       (latest["Close"] - df.iloc[-3]["Close"]) / df.iloc[-3]["Close"] if len(df) >= 3 else 0,
-        "return_5d":       (latest["Close"] - df.iloc[-6]["Close"]) / df.iloc[-6]["Close"] if len(df) >= 6 else 0,
-        "price_vs_ma5":    latest["Close"] / closes.tail(5).mean()  - 1,
-        "price_vs_ma10":   latest["Close"] / closes.tail(10).mean() - 1,
-        "price_vs_ma20":   latest["Close"] / closes.tail(20).mean() - 1,
-        "volatility_5d":   closes.pct_change().tail(5).std(),
-        "volatility_10d":  closes.pct_change().tail(10).std(),
-        "volume_change":   (latest["Volume"] - prev["Volume"]) / (prev["Volume"] + 1),
-        "volume_vs_ma5":   latest["Volume"] / df["Volume"].tail(5).mean() - 1,
-        "high_low_range":  (latest["High"] - latest["Low"]) / latest["Close"],
-    }
+if st.button("Analyze"):
 
-    delta = closes.diff()
-    gain  = delta.clip(lower=0).tail(14).mean()
-    loss  = (-delta.clip(upper=0)).tail(14).mean()
-    rs    = gain / (loss + 1e-9)
-    features["rsi"] = 100 - (100 / (1 + rs))
-
-    avg_pos = avg_neg = avg_neu = pos_ratio = neg_ratio = sentiment_score = 0.0
-    features.update({
-        "avg_positive": avg_pos, "avg_negative": avg_neg,
-        "avg_neutral": avg_neu, "avg_confidence": 0.0,
-        "n_articles": 0, "positive_ratio": pos_ratio,
-        "negative_ratio": neg_ratio, "sentiment_score": sentiment_score
-    })
-
-    price_info = {
-        "current_price": round(latest["Close"], 2),
-        "change_pct":    round((latest["Close"] - prev["Close"]) / prev["Close"] * 100, 2),
-        "high":          round(latest["High"], 2),
-        "low":           round(latest["Low"], 2),
-        "volume":        int(latest["Volume"]),
-        "history":       df["Close"].tail(30)
-    }
-    return features, price_info
-
-def build_features(price_features, sentiment_df):
-    f = dict(price_features)
-    if not sentiment_df.empty:
-        f["avg_positive"]    = sentiment_df["positive"].mean()
-        f["avg_negative"]    = sentiment_df["negative"].mean()
-        f["avg_neutral"]     = sentiment_df["neutral"].mean()
-        f["avg_confidence"]  = sentiment_df["confidence"].mean()
-        f["n_articles"]      = len(sentiment_df)
-        f["positive_ratio"]  = (sentiment_df["sentiment"] == "positive").mean()
-        f["negative_ratio"]  = (sentiment_df["sentiment"] == "negative").mean()
-        f["sentiment_score"] = f["avg_positive"] - f["avg_negative"]
-    return pd.DataFrame([f])
-
-STOCKS = {
-    "AAPL — Apple":       ("AAPL", "Apple"),
-    "TSLA — Tesla":       ("TSLA", "Tesla"),
-    "MSFT — Microsoft":   ("MSFT", "Microsoft"),
-    "GOOGL — Alphabet":   ("GOOGL", "Google Alphabet"),
-}
-
-with st.sidebar:
-    st.markdown("## 📈 FinSentiment Predictor")
-    st.markdown("Real-time news sentiment + price movement prediction using FinBERT.")
-    st.markdown("---")
-    selected    = st.selectbox("Select Stock", list(STOCKS.keys()))
-    ticker, company = STOCKS[selected]
-    analyze_btn = st.button("🔍 Analyze Now")
-    st.markdown("---")
-    st.markdown("**Model:** XGBoost + FinBERT  \n**Data:** NewsAPI + yfinance  \n**Sentiment:** ProsusAI/finbert")
-
-st.markdown("# 📈 FinSentiment Stock Predictor")
-st.markdown("Real-time financial news sentiment analysis + next-day price movement prediction.")
-st.markdown("---")
-
-if not analyze_btn:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("""<div class="metric-card">
-            <div class="metric-label">Sentiment Model</div>
-            <div class="metric-value" style="font-size:16px;color:#667eea;">ProsusAI/FinBERT</div>
-        </div>""", unsafe_allow_html=True)
-    with col2:
-        st.markdown("""<div class="metric-card">
-            <div class="metric-label">Stocks Covered</div>
-            <div class="metric-value" style="color:#667eea;">4</div>
-        </div>""", unsafe_allow_html=True)
-    with col3:
-        st.markdown("""<div class="metric-card">
-            <div class="metric-label">FinBERT Accuracy</div>
-            <div class="metric-value" style="color:#667eea;">90%</div>
-        </div>""", unsafe_allow_html=True)
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.info("👈 Select a stock from the sidebar and click **Analyze Now** to get a sentiment-based prediction.")
-
-else:
-    with st.spinner(f"Fetching data for {ticker}..."):
-        price_features, price_info = fetch_price_data(ticker)
-        news = fetch_news(ticker, company)
+    # PRICE
+    price_features, price_info = fetch_price_data(ticker)
 
     if price_info is None:
-        st.error("Could not fetch price data. Please try again.")
+        st.warning("⚠️ Rate limit reached. Please wait and try again.")
         st.stop()
 
-    with st.spinner("Running FinBERT sentiment analysis..."):
-        finbert      = load_finbert()
-        sentiment_df = analyze_sentiment(news, finbert) if news else pd.DataFrame()
+    # NEWS
+    headlines = fetch_news(ticker)
 
-    change_color = "up"   if price_info["change_pct"] >= 0 else "down"
-    change_arrow = "▲"    if price_info["change_pct"] >= 0 else "▼"
+    # SENTIMENT
+    finbert = load_finbert()
+    sentiments = analyze_sentiment(headlines, finbert)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown(f"""<div class="metric-card">
-            <div class="metric-label">Current Price</div>
-            <div class="metric-value" style="color:#c9d1d9;">${price_info['current_price']}</div>
-        </div>""", unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""<div class="metric-card">
-            <div class="metric-label">Day Change</div>
-            <div class="metric-value {change_color}">{change_arrow} {abs(price_info['change_pct'])}%</div>
-        </div>""", unsafe_allow_html=True)
-    with col3:
-        rsi_val   = round(price_features.get("rsi", 50), 1)
-        rsi_color = "down" if rsi_val > 70 else "up" if rsi_val < 30 else "neutral"
-        st.markdown(f"""<div class="metric-card">
-            <div class="metric-label">RSI (14)</div>
-            <div class="metric-value {rsi_color}">{rsi_val}</div>
-        </div>""", unsafe_allow_html=True)
-    with col4:
-        n_articles = len(sentiment_df) if not sentiment_df.empty else 0
-        st.markdown(f"""<div class="metric-card">
-            <div class="metric-label">News Articles</div>
-            <div class="metric-value" style="color:#667eea;">{n_articles}</div>
-        </div>""", unsafe_allow_html=True)
+    # ---------------- METRICS ----------------
+    col1, col2, col3 = st.columns(3)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    col1.metric("Price", f"${price_info['current_price']}")
+    col2.metric("Change %", f"{price_info['change_pct']}%")
+    col3.metric("News Count", len(headlines))
 
-    col_chart, col_sent = st.columns([3, 2])
-    with col_chart:
-        st.markdown("#### 📉 30-Day Price History")
-        hist = price_info["history"]
-        fig  = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=hist.index, y=hist.values, mode='lines',
-            line=dict(color='#667eea', width=2),
-            fill='tozeroy', fillcolor='rgba(102,126,234,0.1)', name=ticker
-        ))
-        fig.update_layout(
-            paper_bgcolor='#1e2130', plot_bgcolor='#1e2130',
-            font=dict(color='#8b9ab0', size=11),
-            margin=dict(l=10, r=10, t=10, b=10),
-            xaxis=dict(gridcolor='#2d3250'),
-            yaxis=dict(gridcolor='#2d3250', tickprefix='$'),
-            height=220, showlegend=False
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # ---------------- CHART ----------------
+    fig = go.Figure()
+    hist = price_info["history"]
 
-    with col_sent:
-        st.markdown("#### 🧠 Sentiment Breakdown")
-        if not sentiment_df.empty:
-            sent_counts = sentiment_df["sentiment"].value_counts()
-            colors      = {"positive": "#2ecc71", "negative": "#e74c3c", "neutral": "#f39c12"}
-            fig2        = go.Figure(go.Pie(
-                labels=sent_counts.index, values=sent_counts.values, hole=0.5,
-                marker=dict(colors=[colors.get(l, "#667eea") for l in sent_counts.index]),
-                textfont=dict(size=12)
-            ))
-            fig2.update_layout(
-                paper_bgcolor='#1e2130', plot_bgcolor='#1e2130',
-                font=dict(color='#8b9ab0'),
-                margin=dict(l=10, r=10, t=10, b=10),
-                height=220, legend=dict(font=dict(color='#c9d1d9'))
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("No news articles found for the selected period.")
+    fig.add_trace(go.Scatter(x=hist.index, y=hist.values))
 
-    st.markdown("---")
-    st.markdown("#### 🎯 Movement Prediction")
+    st.plotly_chart(fig, use_container_width=True)
 
+    # ---------------- SENTIMENT ----------------
+    if sentiments:
+        pos = sentiments.count("positive")
+        neg = sentiments.count("negative")
+        neu = sentiments.count("neutral")
+
+        st.write("### Sentiment")
+        st.write(f"🟢 Positive: {pos}")
+        st.write(f"🔴 Negative: {neg}")
+        st.write(f"🟡 Neutral: {neu}")
+    else:
+        st.info("No news found.")
+
+    # ---------------- MODEL ----------------
     model, feature_cols = load_model()
-    feature_df          = build_features(price_features, sentiment_df)
 
-    if model is not None and feature_cols is not None:
+    if model:
+        df = pd.DataFrame([price_features])
+
         for col in feature_cols:
-            if col not in feature_df.columns:
-                feature_df[col] = 0
-        feature_df = feature_df[feature_cols]
+            if col not in df.columns:
+                df[col] = 0
 
-        prob       = model.predict_proba(feature_df)[0]
-        pred       = model.predict(feature_df)[0]
-        confidence = round(max(prob) * 100, 1)
+        df = df[feature_cols]
 
-        pred_label          = "UP ▲" if pred == 1 else "DOWN ▼"
-        pred_color          = "up"   if pred == 1 else "down"
-        pred_interpretation = (
-            "Positive sentiment and technical indicators suggest upward movement tomorrow."
-            if pred == 1 else
-            "Negative sentiment or weak technical signals suggest downward pressure tomorrow."
-        )
+        pred = model.predict(df)[0]
+        prob = model.predict_proba(df)[0]
 
-        col_pred, col_conf, col_sent_score = st.columns(3)
-        with col_pred:
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-label">Predicted Movement</div>
-                <div class="metric-value {pred_color}">{pred_label}</div>
-            </div>""", unsafe_allow_html=True)
-        with col_conf:
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-label">Confidence</div>
-                <div class="metric-value" style="color:#667eea;">{confidence:.1f}%</div>
-            </div>""", unsafe_allow_html=True)
-        with col_sent_score:
-            sent_score  = round(
-                (sentiment_df["positive"].mean() - sentiment_df["negative"].mean()) * 100
-                if not sentiment_df.empty else 0, 1
-            )
-            score_color = "up" if sent_score > 0 else "down" if sent_score < 0 else "neutral"
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-label">Sentiment Score</div>
-                <div class="metric-value {score_color}">{sent_score:+.1f}</div>
-            </div>""", unsafe_allow_html=True)
+        st.write("### Prediction")
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        border_color = '#2ecc71' if pred == 1 else '#e74c3c'
-        emoji        = '📈' if pred == 1 else '📉'
-        st.markdown(f"""
-        <div style="background:#1e2130;border-radius:10px;padding:16px 20px;border-left:4px solid {border_color};">
-            <strong>{emoji} {pred_label} — {confidence:.1f}% confidence</strong><br><br>
-            {pred_interpretation}<br><br>
-            <span style="font-size:11px;color:#8b9ab0;">⚠️ This is a research tool. Not financial advice. Always do your own research before investing.</span>
-        </div>""", unsafe_allow_html=True)
+        if pred == 1:
+            st.success(f"📈 UP ({round(max(prob)*100,1)}%)")
+        else:
+            st.error(f"📉 DOWN ({round(max(prob)*100,1)}%)")
+
     else:
-        st.warning("Trained model not found. Run the EDA notebook first.")
-
-    st.markdown("---")
-    st.markdown(f"#### 📰 Latest News — {ticker}")
-
-    if not sentiment_df.empty:
-        for _, row in sentiment_df.head(8).iterrows():
-            sent_class = {"positive": "pos", "negative": "neg", "neutral": "neu"}.get(row["sentiment"], "neu")
-            sent_emoji = {"positive": "🟢", "negative": "🔴", "neutral": "🟡"}.get(row["sentiment"], "🟡")
-            conf_pct   = round(row["confidence"] * 100, 1)
-            st.markdown(f"""
-            <div class="news-card {sent_class}">
-                <div class="news-title">{row['title']}</div>
-                <div class="news-meta">{sent_emoji} {row['sentiment'].title()} ({conf_pct}%) · {row['source']} · {row['date']}</div>
-            </div>""", unsafe_allow_html=True)
-    else:
-        st.info("No recent news articles found.")
-
-    st.markdown("---")
-    st.caption("Model: XGBoost + ProsusAI/FinBERT · Data: NewsAPI + yfinance · Built by Azim Sadath · Not financial advice")
+        st.warning("Model not found.")
