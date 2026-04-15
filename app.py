@@ -179,6 +179,9 @@ if st.button("Analyze"):
 model, feature_cols = load_model()
 
 if model:
+    if 'price_features' not in locals():
+    st.error("Price features not generated. Check data fetching or preprocessing.")
+    st.stop()
     df = pd.DataFrame([price_features])
 
     for col in feature_cols:
