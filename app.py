@@ -53,7 +53,7 @@ def load_model():
     except:
         return None, None
 
-# -------------------- FETCH PRICE DATA (FIXED) --------------------
+# -------------------- FETCH PRICE DATA --------------------
 @st.cache_data(ttl=300)
 def fetch_price_data(ticker):
     for attempt in range(3):
@@ -131,51 +131,7 @@ st.title("📈 FinSentiment Stock Predictor")
 STOCKS = ["AAPL", "TSLA", "MSFT", "GOOGL"]
 ticker = st.selectbox("Select Stock", STOCKS)
 
-if st.button("Analyze"):
-
-    # PRICE
-    price_features, price_info = fetch_price_data(ticker)
-
-    if price_info is None:
-        st.warning("⚠️ Rate limit reached. Please wait and try again.")
-        st.stop()
-
-    # NEWS
-    headlines = fetch_news(ticker)
-
-    # SENTIMENT
-    finbert = load_finbert()
-    sentiments = analyze_sentiment(headlines, finbert)
-
-    # ---------------- METRICS ----------------
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Price", f"${price_info['current_price']}")
-    col2.metric("Change %", f"{price_info['change_pct']}%")
-    col3.metric("News Count", len(headlines))
-
-    # ---------------- CHART ----------------
-    fig = go.Figure()
-    hist = price_info["history"]
-
-    fig.add_trace(go.Scatter(x=hist.index, y=hist.values))
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ---------------- SENTIMENT ----------------
-    if sentiments:
-        pos = sentiments.count("positive")
-        neg = sentiments.count("negative")
-        neu = sentiments.count("neutral")
-
-        st.write("### Sentiment")
-        st.write(f"🟢 Positive: {pos}")
-        st.write(f"🔴 Negative: {neg}")
-        st.write(f"🟡 Neutral: {neu}")
-    else:
-        st.info("No news found.")
-
-   # ---------------- MODEL ----------------
+# ✅ ONLY ONE BUTTON (FIXED)
 if st.button("Analyze"):
 
     # PRICE
@@ -194,6 +150,7 @@ if st.button("Analyze"):
 
     # ---------------- METRICS ----------------
     col1, col2, col3 = st.columns(3)
+
     col1.metric("Price", f"${price_info['current_price']}")
     col2.metric("Change %", f"{price_info['change_pct']}%")
     col3.metric("News Count", len(headlines))
@@ -217,16 +174,11 @@ if st.button("Analyze"):
     else:
         st.info("No news found.")
 
-    # ---------------- LOAD MODEL ----------------
+    # ---------------- MODEL ----------------
     model, feature_cols = load_model()
 
     if model is None:
         st.warning("Model not found.")
-        st.stop()
-
-    # ---------------- FEATURE CHECK ----------------
-    if price_features is None:
-        st.error("Price features not generated.")
         st.stop()
 
     df = pd.DataFrame([price_features])
