@@ -81,8 +81,8 @@ def fetch_price_data(ticker):
             features["rsi"] = 100 - (100 / (1 + rs))
 
             price_info = {
-                "current_price": round(latest["Close"], 2),
-                "change_pct": round((latest["Close"] - prev["Close"]) / prev["Close"] * 100, 2),
+                "current_price": round(float(latest["Close"]), 2),
+                "change_pct": round(float((latest["Close"] - prev["Close"]) / prev["Close"] * 100), 2),
                 "history": df["Close"].tail(30)
             }
 
@@ -150,9 +150,9 @@ if st.button("Analyze"):
 
     # ---------------- METRICS ----------------
     col1, col2, col3 = st.columns(3)
-
-    col1.metric("Price", f"${price_info['current_price']}")
-    col2.metric("Change %", f"{price_info['change_pct']}%")
+    col1.metric("Price", f"${price_info['current_price']:.2f}")
+    change = price_info['change_pct']
+    col2.metric("Change %", f"{price_info['change_pct']:.2f}%")
     col3.metric("News Count", len(headlines))
 
     # ---------------- CHART ----------------
