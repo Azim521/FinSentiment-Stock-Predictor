@@ -67,22 +67,42 @@ def fetch_price_data(ticker):
             prev = df.iloc[-2] if len(df) > 1 else latest
             closes = df["Close"]
 
+            # ✅ SAFE SCALAR EXTRACTION
+            latest_close = latest["Close"]
+            prev_close = prev["Close"]
+
+            if isinstance(latest_close, pd.Series):
+                latest_close = latest_close.values[0]
+
+            if isinstance(prev_close, pd.Series):
+                prev_close = prev_close.values[0]
+
+            # ✅ HANDLE NaN
+            if pd.isna(latest_close) or pd.isna(prev_close):
+                return None, None
+
+            latest_close = float(latest_close)
+            prev_close = float(prev_close)
+
+            # ✅ FEATURES (FIXED)
             features = {
-                "daily_return": (latest["Close"] - prev["Close"]) / prev["Close"],
-                "price_vs_ma5": latest["Close"] / closes.tail(5).mean() - 1,
-                "price_vs_ma10": latest["Close"] / closes.tail(10).mean() - 1,
+                "daily_return": (latest_close - prev_close) / prev_close,
+                "price_vs_ma5": latest_close / closes.tail(5).mean(skipna=True) - 1,
+                "price_vs_ma10": latest_close / closes.tail(10).mean() - 1,
                 "volatility_5d": closes.pct_change().tail(5).std(),
             }
 
+            # RSI
             delta = closes.diff()
             gain = delta.clip(lower=0).tail(14).mean()
             loss = (-delta.clip(upper=0)).tail(14).mean()
             rs = gain / (loss + 1e-9)
             features["rsi"] = 100 - (100 / (1 + rs))
 
+            # ✅ PRICE INFO (FIXED)
             price_info = {
-                "current_price": round(float(latest["Close"]), 2),
-                "change_pct": round(float((latest["Close"] - prev["Close"]) / prev["Close"] * 100), 2),
+                "current_price": round(latest_close, 2),
+                "change_pct": round(((latest_close - prev_close) / prev_close) * 100, 2),
                 "history": df["Close"].tail(30)
             }
 
