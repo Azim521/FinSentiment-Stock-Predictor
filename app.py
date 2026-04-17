@@ -8,7 +8,11 @@ import time
 from datetime import datetime
 from transformers import pipeline
 import plotly.graph_objects as go
-from yfinance.exceptions import YFRateLimitError
+
+try:
+    from yfinance.exceptions import YFRateLimitError
+except ImportError:
+    YFRateLimitError = Exception  # fallback for older yfinance
 
 st.set_page_config(
     page_title="FinSentiment Stock Predictor",
@@ -16,7 +20,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# -------------------- STYLE --------------------
 st.markdown("""
 <style>
 .main { background-color: #0e1117; }
@@ -37,12 +40,14 @@ st.markdown("""
 
 NEWS_API_KEY = st.secrets.get("NEWS_API_KEY", "")
 
-# -------------------- LOAD MODELS --------------------
 @st.cache_resource
 def load_finbert():
-    return pipeline("text-classification",
-                    model="ProsusAI/finbert",
-                    tokenizer="ProsusAI/finbert")
+    return pipeline(
+        "text-classification",
+        model="ProsusAI/finbert",
+        tokenizer="ProsusAI/finbert",
+        device=-1  # force CPU
+    )
 
 @st.cache_resource
 def load_model():
@@ -50,74 +55,85 @@ def load_model():
         model = joblib.load("model/xgb_sentiment_model.pkl")
         features = joblib.load("model/feature_columns.pkl")
         return model, features
-    except:
+    except Exception as e:
+        st.error(f"Model load error: {e}")
         return None, None
 
-# -------------------- FETCH PRICE DATA --------------------
 @st.cache_data(ttl=300)
 def fetch_price_data(ticker):
     for attempt in range(3):
         try:
             df = yf.download(ticker, period="1mo", progress=False)
-
             if df.empty:
                 return None, None
 
-            latest = df.iloc[-1]
-            prev = df.iloc[-2] if len(df) > 1 else latest
-            closes = df["Close"]
+            # ✅ FIX: Flatten MultiIndex columns (yfinance 0.2.x+)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
-            # ✅ SAFE SCALAR EXTRACTION
-            latest_close = latest["Close"]
-            prev_close = prev["Close"]
+            if "Close" not in df.columns:
+                return None, None
 
-            if isinstance(latest_close, pd.Series):
-                latest_close = latest_close.values[0]
+            closes = df["Close"].squeeze()  # ensure Series
+            latest_close = float(closes.iloc[-1])
+            prev_close = float(closes.iloc[-2]) if len(closes) > 1 else latest_close
 
-            if isinstance(prev_close, pd.Series):
-                prev_close = prev_close.values[0]
-
-            # ✅ HANDLE NaN
             if pd.isna(latest_close) or pd.isna(prev_close):
                 return None, None
 
-            latest_close = float(latest_close)
-            prev_close = float(prev_close)
+            pct_changes = closes.pct_change().dropna()
 
-            # ✅ FEATURES (FIXED)
             features = {
-                "daily_return": (latest_close - prev_close) / prev_close,
-                "price_vs_ma5": latest_close / closes.tail(5).mean(skipna=True) - 1,
-                "price_vs_ma10": latest_close / closes.tail(10).mean() - 1,
-                "volatility_5d": closes.pct_change().tail(5).std(),
+                "daily_return": (latest_close - prev_close) / (prev_close + 1e-9),
+                "return_2d": (latest_close - float(closes.iloc[-3])) / float(closes.iloc[-3]) if len(closes) >= 3 else 0,
+                "return_5d": (latest_close - float(closes.iloc[-6])) / float(closes.iloc[-6]) if len(closes) >= 6 else 0,
+                "price_vs_ma5": latest_close / (closes.tail(5).mean() + 1e-9) - 1,
+                "price_vs_ma10": latest_close / (closes.tail(10).mean() + 1e-9) - 1,
+                "price_vs_ma20": latest_close / (closes.tail(20).mean() + 1e-9) - 1,
+                "volatility_5d": pct_changes.tail(5).std() if len(pct_changes) >= 5 else 0,
+                "volatility_10d": pct_changes.tail(10).std() if len(pct_changes) >= 10 else 0,
             }
+
+            # Volume features
+            if "Volume" in df.columns:
+                vol = df["Volume"].squeeze()
+                features["volume_change"] = float(vol.iloc[-1]) / (float(vol.iloc[-2]) + 1e-9) - 1 if len(vol) > 1 else 0
+                features["vol_vs_ma5"] = float(vol.iloc[-1]) / (vol.tail(5).mean() + 1e-9) - 1
+            else:
+                features["volume_change"] = 0
+                features["vol_vs_ma5"] = 0
 
             # RSI
             delta = closes.diff()
             gain = delta.clip(lower=0).tail(14).mean()
             loss = (-delta.clip(upper=0)).tail(14).mean()
             rs = gain / (loss + 1e-9)
-            features["rsi"] = 100 - (100 / (1 + rs))
+            features["rsi"] = float(100 - (100 / (1 + rs)))
 
-            # ✅ PRICE INFO (FIXED)
+            # High-Low range
+            if "High" in df.columns and "Low" in df.columns:
+                features["high_low_range"] = float(df["High"].iloc[-1]) - float(df["Low"].iloc[-1])
+            else:
+                features["high_low_range"] = 0
+
             price_info = {
                 "current_price": round(latest_close, 2),
-                "change_pct": round(((latest_close - prev_close) / prev_close) * 100, 2),
-                "history": df["Close"].tail(30)
+                "change_pct": round(((latest_close - prev_close) / (prev_close + 1e-9)) * 100, 2),
+                "history": closes.tail(30)
             }
-
             return features, price_info
 
         except YFRateLimitError:
             time.sleep(2)
+        except Exception as e:
+            st.warning(f"Price fetch error: {e}")
+            return None, None
 
     return None, None
 
-# -------------------- FETCH NEWS --------------------
 def fetch_news(ticker):
     if not NEWS_API_KEY:
         return []
-
     url = "https://newsapi.org/v2/everything"
     params = {
         "q": f"{ticker} stock",
@@ -126,7 +142,6 @@ def fetch_news(ticker):
         "pageSize": 10,
         "apiKey": NEWS_API_KEY
     }
-
     try:
         res = requests.get(url, params=params, timeout=10)
         data = res.json()
@@ -134,16 +149,15 @@ def fetch_news(ticker):
     except:
         return []
 
-# -------------------- SENTIMENT --------------------
 def analyze_sentiment(headlines, finbert):
-    sentiments = []
+    results = []
     for h in headlines:
         try:
             r = finbert(h[:512])[0]
-            sentiments.append(r["label"])
+            results.append(r)
         except:
             continue
-    return sentiments
+    return results
 
 # -------------------- UI --------------------
 st.title("📈 FinSentiment Stock Predictor")
@@ -151,75 +165,95 @@ st.title("📈 FinSentiment Stock Predictor")
 STOCKS = ["AAPL", "TSLA", "MSFT", "GOOGL"]
 ticker = st.selectbox("Select Stock", STOCKS)
 
-# ✅ ONLY ONE BUTTON (FIXED)
 if st.button("Analyze"):
-
-    # PRICE
-    price_features, price_info = fetch_price_data(ticker)
+    with st.spinner("Fetching price data..."):
+        price_features, price_info = fetch_price_data(ticker)
 
     if price_info is None or price_features is None:
-        st.warning("⚠️ Failed to fetch price data.")
+        st.warning("⚠️ Failed to fetch price data. yfinance may be rate-limited. Try again in a few seconds.")
         st.stop()
 
-    # NEWS
-    headlines = fetch_news(ticker)
+    with st.spinner("Fetching news..."):
+        headlines = fetch_news(ticker)
 
-    # SENTIMENT
-    finbert = load_finbert()
-    sentiments = analyze_sentiment(headlines, finbert)
+    with st.spinner("Running FinBERT sentiment analysis..."):
+        finbert = load_finbert()
+        sentiment_results = analyze_sentiment(headlines, finbert)
 
-    # ---------------- METRICS ----------------
+    # ---- METRICS ----
     col1, col2, col3 = st.columns(3)
     col1.metric("Price", f"${price_info['current_price']:.2f}")
-    change = price_info['change_pct']
     col2.metric("Change %", f"{price_info['change_pct']:.2f}%")
     col3.metric("News Count", len(headlines))
 
-    # ---------------- CHART ----------------
+    # ---- CHART ----
+    hist = price_info["history"].squeeze()
     fig = go.Figure()
-    hist = price_info["history"]
-    fig.add_trace(go.Scatter(x=hist.index, y=hist.values))
+    fig.add_trace(go.Scatter(x=hist.index, y=hist.values.flatten(), mode="lines"))
+    fig.update_layout(template="plotly_dark", title=f"{ticker} — Last 30 Days")
     st.plotly_chart(fig, use_container_width=True)
 
-    # ---------------- SENTIMENT ----------------
-    if sentiments:
-        pos = sentiments.count("positive")
-        neg = sentiments.count("negative")
-        neu = sentiments.count("neutral")
+    # ---- SENTIMENT ----
+    if sentiment_results:
+        labels = [r["label"] for r in sentiment_results]
+        scores = [r["score"] for r in sentiment_results]
+        pos = labels.count("positive")
+        neg = labels.count("negative")
+        neu = labels.count("neutral")
+        total = len(labels)
 
-        st.write("### Sentiment")
-        st.write(f"🟢 Positive: {pos}")
-        st.write(f"🔴 Negative: {neg}")
-        st.write(f"🟡 Neutral: {neu}")
+        st.write("### 📰 News Sentiment")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("🟢 Positive", pos)
+        col2.metric("🔴 Negative", neg)
+        col3.metric("🟡 Neutral", neu)
+
+        # Show individual headlines
+        for i, (h, r) in enumerate(zip(headlines, sentiment_results)):
+            color = "🟢" if r["label"] == "positive" else ("🔴" if r["label"] == "negative" else "🟡")
+            st.write(f"{color} **{r['label'].upper()}** ({r['score']*100:.0f}%) — {h}")
+
+        # Build sentiment features for model
+        pos_scores = [scores[i] for i, l in enumerate(labels) if l == "positive"]
+        neg_scores = [scores[i] for i, l in enumerate(labels) if l == "negative"]
+        neu_scores = [scores[i] for i, l in enumerate(labels) if l == "neutral"]
+
+        price_features["avg_positive"] = np.mean(pos_scores) if pos_scores else 0
+        price_features["avg_negative"] = np.mean(neg_scores) if neg_scores else 0
+        price_features["avg_neutral"] = np.mean(neu_scores) if neu_scores else 0
+        price_features["pos_ratio"] = pos / total if total > 0 else 0
+        price_features["sentiment_score"] = (pos - neg) / total if total > 0 else 0
+        price_features["article_count"] = total
     else:
-        st.info("No news found.")
+        st.info("ℹ️ No news found. Check that NEWS_API_KEY is set in Streamlit secrets.")
+        price_features["avg_positive"] = 0
+        price_features["avg_negative"] = 0
+        price_features["avg_neutral"] = 0
+        price_features["pos_ratio"] = 0
+        price_features["sentiment_score"] = 0
+        price_features["article_count"] = 0
 
-    # ---------------- MODEL ----------------
+    # ---- MODEL PREDICTION ----
     model, feature_cols = load_model()
-
     if model is None:
-        st.warning("Model not found.")
+        st.warning("⚠️ Model not found.")
         st.stop()
 
-    df = pd.DataFrame([price_features])
-
+    df_pred = pd.DataFrame([price_features])
     for col in feature_cols:
-        if col not in df.columns:
-            df[col] = 0
+        if col not in df_pred.columns:
+            df_pred[col] = 0
+    df_pred = df_pred[feature_cols]
+    df_pred = df_pred.apply(pd.to_numeric, errors='coerce')
+    df_pred = df_pred.replace([np.inf, -np.inf], 0).fillna(0).astype(np.float32)
 
-    df = df[feature_cols]
+    pred = model.predict(df_pred)[0]
+    prob = model.predict_proba(df_pred)[0]
+    confidence = round(max(prob) * 100, 1)
 
-    # CLEANING
-    df = df.apply(pd.to_numeric, errors='coerce')
-    df = df.replace([np.inf, -np.inf], 0)
-    df = df.fillna(0)
-    df = df.astype(np.float32)
-
-    # PREDICTION
-    pred = model.predict(df)[0]
-    prob = model.predict_proba(df)[0]
-
+    st.write("### 🤖 Model Prediction")
     if pred == 1:
-        st.success(f"📈 UP ({round(max(prob)*100,1)}%)")
+        st.success(f"📈 Predicted: **UP** — {confidence}% confidence")
     else:
-        st.error(f"📉 DOWN ({round(max(prob)*100,1)}%)")
+        st.error(f"📉 Predicted: **DOWN** — {confidence}% confidence")
+    st.caption("Note: ROC-AUC 0.529 — slight edge over random. Not financial advice.")
